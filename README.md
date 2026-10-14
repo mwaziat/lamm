@@ -13,23 +13,36 @@
 
 Read **`docs/REAL-OPTIMIZATION-STATUS.md`** for exact functionality, limitations, validation and next implementation work.
 
-## Build and run on Ubuntu GNOME 50
+## Installation on Ubuntu (GNOME Wayland)
+
+### Option A: Standard Ubuntu Package (.deb via apt) — Recommended
+Build a single, clean `.deb` package that bundles all components:
 
 ```bash
-sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev
-cargo check --workspace
-cargo test --workspace
-./scripts/install-user.sh
-./scripts/install-gnome-bridge.sh
+# 1. Build the Debian package (developer / packaging)
+./scripts/build-deb.sh
+
+# 2. Install single package on any Ubuntu system via apt
+sudo apt install ./target/lamm_0.2.1_amd64.deb
+
+# 3. Clean uninstall anytime via apt
+sudo apt remove lamm
 ```
 
-Log out and log in again on Wayland, then run:
-
+### Option B: Local User Install (without root)
 ```bash
-gnome-extensions enable lamm-activity@lamm.local
-cat "$XDG_RUNTIME_DIR/lamm-activity.csv"
+# Build and install for current user only
+./install.sh
+
+# Uninstall
+./scripts/uninstall-user.sh
+```
+
+### Verify Service and Status
+```bash
 systemctl --user status lamm-daemon
 journalctl --user -u lamm-daemon -f
+lammctl
 ```
 
 Initial settings are experimental and may not change properties on distributions that restrict systemd app scopes. For uninstall see `scripts/uninstall-user.sh`. Check changed unit property state and reset it manually if needed; runtime changes do not always disappear merely by stopping the daemon.

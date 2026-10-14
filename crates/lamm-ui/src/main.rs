@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use gtk::{glib, prelude::*};
+use gtk::glib;
 use std::{io::Read, os::unix::net::UnixStream, time::Duration};
 
 fn query() -> Result<lamm_core::Snapshot, String> {

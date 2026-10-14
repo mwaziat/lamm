@@ -9,12 +9,11 @@ use std::{
 
 pub static RUNNING: AtomicBool = AtomicBool::new(true);
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const BRIDGE_MAX_AGE: Duration = Duration::from_secs(12);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const PSI_PRESSURE_THRESHOLD: f64 = 10.0;
-const RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
-const RECLAIM_PAGE_AMOUNT: &str = "64M";
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const BACKGROUND_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+const ACTIVE_RECLAIM_COOLDOWN: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
@@ -39,7 +38,7 @@ impl Visibility {
             Self::Active => 400,
             Self::Visible => 250,
             Self::Background => 80,
-            Self::Idle => 40,
+            Self::Idle => 50,
         }
     }
 
@@ -55,8 +54,35 @@ impl Visibility {
         match self {
             Self::Active => 400,
             Self::Visible => 250,
-            Self::Background => 80,
-            Self::Idle => 40,
+            Self::Background => 100,
+            Self::Idle => 50,
+        }
+    }
+
+    pub fn percentage_reclaim_mb(self, current_mb: u64) -> u64 {
+        if current_mb < 80 {
+            return 0;
+        }
+
+        let pct = match self {
+            Self::Active | Self::Visible => 0.10,
+            Self::Background => 0.20,
+            Self::Idle => 0.35,
+        };
+
+        let calculated = (current_mb as f64 * pct) as u64;
+
+        match self {
+            Self::Active | Self::Visible => calculated.min(800),
+            Self::Background => calculated.min(1000),
+            Self::Idle => calculated.min(2500),
+        }
+    }
+
+    pub fn cooldown(self) -> Duration {
+        match self {
+            Self::Active | Self::Visible => ACTIVE_RECLAIM_COOLDOWN,
+            Self::Background | Self::Idle => BACKGROUND_RECLAIM_COOLDOWN,
         }
     }
 }
@@ -119,10 +145,30 @@ fn is_protected_unit(unit: &str) -> bool {
         || unit.contains("portal")
 }
 
+fn read_memory_current_mb(cgroup_rel_path: &str) -> u64 {
+    let path = format!("/sys/fs/cgroup{cgroup_rel_path}/memory.current");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|val| val.trim().parse::<u64>().ok())
+        .map(|bytes| bytes / 1048576)
+        .unwrap_or(0)
+}
+
+fn try_cgroup_reclaim(cgroup_rel_path: &str, amount_mb: u64) -> u64 {
+    let path = format!("/sys/fs/cgroup{cgroup_rel_path}/memory.reclaim");
+    if Path::new(&path).exists() == false || amount_mb == 0 {
+        return 0;
+    }
+    let before = read_memory_current_mb(cgroup_rel_path);
+    let _ = fs::write(&path, format!("{amount_mb}M\n"));
+    let after = read_memory_current_mb(cgroup_rel_path);
+    before.saturating_sub(after)
+}
+
 fn bridge_states(path: &Path) -> io::Result<HashMap<String, ScopeInfo>> {
     let data = fs::read_to_string(path)?;
     let mut states: HashMap<String, ScopeInfo> = HashMap::new();
-    if !data.starts_with("TIME,") {
+    if data.starts_with("TIME,") == false {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bridge header"));
     }
     for line in data.lines().skip(1) {
@@ -151,19 +197,45 @@ fn bridge_states(path: &Path) -> io::Result<HashMap<String, ScopeInfo>> {
     Ok(states)
 }
 
+fn discover_active_app_scopes() -> HashMap<String, ScopeInfo> {
+    let mut states = HashMap::new();
+    let app_slice = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice";
+    if let Ok(entries) = fs::read_dir(app_slice) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if (name.starts_with("app-") || name.starts_with("snap.")) && name.ends_with(".scope") {
+                let rel_path = format!("/user.slice/user-1000.slice/user@1000.service/app.slice/{name}");
+                states.insert(
+                    name,
+                    ScopeInfo {
+                        state: Visibility::Background,
+                        cgroup_rel_path: rel_path,
+                    },
+                );
+            }
+        }
+    }
+    states
+}
+
 fn systemd_set(unit: &str, state: Visibility) -> io::Result<()> {
+    let cpu_weight_arg = format!("CPUWeight={}", state.cpu_weight());
+    let memory_low_arg = format!("MemoryLow={}", state.memory_low());
+    let io_weight_arg = format!("IOWeight={}", state.io_weight());
+
     let result = Command::new("systemctl")
         .args([
             "--user",
             "set-property",
             "--runtime",
             unit,
-            &format!("CPUWeight={}", state.cpu_weight()),
-            &format!("MemoryLow={}", state.memory_low()),
-            &format!("IOWeight={}", state.io_weight()),
+            &cpu_weight_arg,
+            &memory_low_arg,
+            &io_weight_arg,
         ])
         .output()?;
-    if !result.status.success() {
+
+    if result.status.success() == false {
         return Err(io::Error::other(format!("{unit}: {}", String::from_utf8_lossy(&result.stderr).trim())));
     }
     Ok(())
@@ -181,25 +253,11 @@ fn systemd_reset(unit: &str) -> io::Result<()> {
             "IOWeight=100",
         ])
         .output()?;
-    if !result.status.success() {
+
+    if result.status.success() == false {
         return Err(io::Error::other(format!("{unit}: {}", String::from_utf8_lossy(&result.stderr).trim())));
     }
     Ok(())
-}
-
-fn try_cgroup_reclaim(cgroup_rel_path: &str) {
-    let path = format!("/sys/fs/cgroup{cgroup_rel_path}/memory.reclaim");
-    if Path::new(&path).exists() {
-        let _ = fs::write(&path, format!("{RECLAIM_PAGE_AMOUNT}\n"));
-    }
-}
-
-fn current_memory_pressure() -> f64 {
-    fs::read_to_string("/proc/pressure/memory")
-        .ok()
-        .and_then(|content| lamm_core::parse_pressure(&content).ok())
-        .map(|p| p.avg10)
-        .unwrap_or(0.0)
 }
 
 pub fn run_policy() {
@@ -215,30 +273,35 @@ pub fn run_policy() {
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut last_reclaim: HashMap<String, Instant> = HashMap::new();
     let mut last_error = Instant::now() - Duration::from_secs(60);
+    let mut last_file_mtime = None;
+    let mut last_periodic_check = Instant::now() - Duration::from_secs(10);
 
     while RUNNING.load(Ordering::SeqCst) {
         std::thread::sleep(POLL_INTERVAL);
-        if !RUNNING.load(Ordering::SeqCst) {
+        if RUNNING.load(Ordering::SeqCst) == false {
             break;
         }
 
-        let fresh = fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|time| time.elapsed().ok())
-            .is_some_and(|age| age < BRIDGE_MAX_AGE);
+        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let fresh = mtime.and_then(|t| t.elapsed().ok()).is_some_and(|age| age < BRIDGE_MAX_AGE);
 
-        if !fresh {
+        let file_changed = mtime.is_some() && mtime != last_file_mtime;
+        let interval_elapsed = last_periodic_check.elapsed() >= Duration::from_secs(5);
+
+        if file_changed == false && interval_elapsed == false {
             continue;
         }
 
-        let current = match bridge_states(&path) {
-            Ok(map) => map,
-            Err(_) => continue,
+        last_file_mtime = mtime;
+        last_periodic_check = Instant::now();
+
+        let current = if fresh {
+            bridge_states(&path).unwrap_or_else(|_| discover_active_app_scopes())
+        } else {
+            discover_active_app_scopes()
         };
 
         let now = Instant::now();
-        let memory_pressure = current_memory_pressure();
 
         for (unit, info) in &current {
             if is_protected_unit(unit) {
@@ -257,33 +320,44 @@ pub fn run_policy() {
 
                 if background_duration >= IDLE_TIMEOUT {
                     state = Visibility::Idle;
+                }
+            }
 
-                    if memory_pressure >= PSI_PRESSURE_THRESHOLD {
-                        let can_reclaim = last_reclaim
-                            .get(unit)
-                            .map(|t| now.duration_since(*t) >= RECLAIM_COOLDOWN)
-                            .unwrap_or(true);
+            let state_changed = applied.get(unit) != Some(&state);
 
-                        if can_reclaim {
-                            try_cgroup_reclaim(&info.cgroup_rel_path);
-                            last_reclaim.insert(unit.clone(), now);
+            if state_changed {
+                match systemd_set(unit, state) {
+                    Ok(()) => {
+                        applied.insert(unit.clone(), state);
+                    }
+                    Err(error) => {
+                        if last_error.elapsed() > Duration::from_secs(30) {
+                            eprintln!("LAMM policy: {error}");
+                            last_error = Instant::now();
                         }
                     }
                 }
             }
 
-            if applied.get(unit) == Some(&state) {
-                continue;
-            }
+            // Execute percentage-based memory reclaim if cooldown allows
+            let can_reclaim = last_reclaim
+                .get(unit)
+                .map(|t| now.duration_since(*t) >= state.cooldown())
+                .unwrap_or(true);
 
-            match systemd_set(unit, state) {
-                Ok(()) => {
-                    applied.insert(unit.clone(), state);
-                }
-                Err(error) => {
-                    if last_error.elapsed() > Duration::from_secs(30) {
-                        eprintln!("LAMM policy: {error}");
-                        last_error = Instant::now();
+            if can_reclaim {
+                let current_mb = read_memory_current_mb(&info.cgroup_rel_path);
+                let target_mb = state.percentage_reclaim_mb(current_mb);
+
+                if target_mb > 0 {
+                    let freed_mb = try_cgroup_reclaim(&info.cgroup_rel_path, target_mb);
+                    let after_mb = read_memory_current_mb(&info.cgroup_rel_path);
+                    last_reclaim.insert(unit.clone(), now);
+
+                    if freed_mb > 0 {
+                        eprintln!(
+                            "LAMM: {unit} [{state:?}] -> Freed {freed_mb} MB (Target: {target_mb} MB | {current_mb} MB -> {after_mb} MB)"
+                        );
                     }
                 }
             }
@@ -291,7 +365,7 @@ pub fn run_policy() {
 
         let missing: HashSet<_> = applied
             .keys()
-            .filter(|unit| !current.contains_key(*unit))
+            .filter(|unit| current.contains_key(*unit) == false)
             .cloned()
             .collect();
 
@@ -323,7 +397,13 @@ mod tests {
         assert!(Visibility::Background.cpu_weight() > Visibility::Idle.cpu_weight());
 
         assert_eq!(Visibility::Background.memory_low(), "0");
-        assert_eq!(Visibility::Idle.memory_low(), "0");
+        assert_eq!(Visibility::Active.percentage_reclaim_mb(50), 0);
+        // 10% of 2000MB => 200MB
+        assert_eq!(Visibility::Active.percentage_reclaim_mb(2000), 200);
+        // 20% of 2000MB => 400MB
+        assert_eq!(Visibility::Background.percentage_reclaim_mb(2000), 400);
+        // 35% of 2000MB => 700MB
+        assert_eq!(Visibility::Idle.percentage_reclaim_mb(2000), 700);
     }
 
     #[test]
@@ -331,6 +411,6 @@ mod tests {
         assert!(is_protected_unit("pipewire.service"));
         assert!(is_protected_unit("wireplumber.service"));
         assert!(is_protected_unit("gnome-shell.scope"));
-        assert!(!is_protected_unit("app-gnome-firefox-123.scope"));
+        assert_eq!(is_protected_unit("app-gnome-firefox-123.scope"), false);
     }
 }

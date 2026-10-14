@@ -1,0 +1,11 @@
+Package: lamm
+Version: 0.2.1
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: LAMM Project Developers <lamm@local>
+Depends: libgtk-4-1, libadwaita-1-0, systemd
+Description: Linux Adaptive Memory Manager
+ Intelligent OS resource policy daemon and desktop optimization tools.
+ Dynamically prioritizes interactive applications and optimizes background workloads.
+

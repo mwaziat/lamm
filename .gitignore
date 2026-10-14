@@ -1,4 +1,18 @@
-/target
+# Build artifacts
+/target/
+*.deb
+
+# Logs and runtime sockets
+*.log
+*.sock
+*.csv
+
+# Backup and temp files
 **/*.rs.bk
+*~
+*.swp
+.DS_Store
+
+# IDE and editor settings
 .idea/
 .vscode/settings.json

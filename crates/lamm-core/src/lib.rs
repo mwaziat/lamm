@@ -21,6 +21,8 @@ pub struct ProcessSample {
     pub pid: u32,
     pub name: String,
     pub rss_kib: u64,
+    #[serde(default)]
+    pub pss_kib: u64,
     pub ppid: u32,
 }
 
@@ -60,6 +62,23 @@ pub fn parse_pressure(input: &str) -> io::Result<Pressure> {
     Ok(Pressure { avg10: field("avg10")?, avg60: field("avg60")?, avg300: field("avg300")? })
 }
 
+pub fn read_smaps_rollup(pid: u32) -> Option<(u64, u64)> {
+    let content = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let mut rss = None;
+    let mut pss = None;
+    for line in content.lines().skip(1) {
+        if let Some(val) = line.strip_prefix("Rss:") {
+            rss = val.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(val) = line.strip_prefix("Pss:") {
+            pss = val.split_whitespace().next().and_then(|v| v.parse().ok());
+        }
+        if rss.is_some() && pss.is_some() {
+            break;
+        }
+    }
+    Some((rss.unwrap_or(0), pss.unwrap_or(0)))
+}
+
 pub fn read_process(pid: u32) -> io::Result<ProcessSample> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
     let name = status.lines().find_map(|line| line.strip_prefix("Name:\t"))
@@ -69,7 +88,15 @@ pub fn read_process(pid: u32) -> io::Result<ProcessSample> {
             .and_then(|v| v.split_whitespace().next())
             .and_then(|v| v.parse().ok()).unwrap_or(0)
     };
-    Ok(ProcessSample { pid, name, rss_kib: value("VmRSS:"), ppid: value("PPid:") as u32 })
+    let default_rss = value("VmRSS:");
+    let ppid = value("PPid:") as u32;
+    let (rss_kib, pss_kib) = if let Some((rollup_rss, rollup_pss)) = read_smaps_rollup(pid) {
+        (if rollup_rss > 0 { rollup_rss } else { default_rss }, rollup_pss)
+    } else {
+        (default_rss, default_rss)
+    };
+
+    Ok(ProcessSample { pid, name, rss_kib, pss_kib, ppid })
 }
 
 pub fn collect_snapshot() -> io::Result<Snapshot> {
@@ -80,11 +107,17 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         let entry = entry?;
         if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
             if let Ok(process) = read_process(pid) {
-                top_processes.push(process);
+                if process.rss_kib > 0 && process.ppid != 2 {
+                    top_processes.push(process);
+                }
             }
         }
     }
-    top_processes.sort_unstable_by(|a, b| b.rss_kib.cmp(&a.rss_kib));
+    top_processes.sort_unstable_by(|a, b| {
+        let mem_b = if b.pss_kib > 0 { b.pss_kib } else { b.rss_kib };
+        let mem_a = if a.pss_kib > 0 { a.pss_kib } else { a.rss_kib };
+        mem_b.cmp(&mem_a)
+    });
     top_processes.truncate(15);
     Ok(Snapshot {
         epoch_seconds: std::time::SystemTime::now()
