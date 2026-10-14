@@ -1,0 +1,13 @@
+[Unit]
+Description=LAMM adaptive OS resource policy daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lamm-daemon
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

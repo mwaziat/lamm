@@ -1,0 +1,8 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {"label": "LAMM: check core", "type": "shell", "command": "cargo check -p lamm-core -p lamm-daemon -p lammctl", "group": "build"},
+    {"label": "LAMM: test", "type": "shell", "command": "cargo test --workspace"},
+    {"label": "LAMM: build all", "type": "shell", "command": "cargo build --workspace"}
+  ]
+}

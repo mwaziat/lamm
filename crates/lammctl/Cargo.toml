@@ -1,0 +1,9 @@
+[package]
+name = "lammctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lamm-core = { path = "../lamm-core" }
+serde_json.workspace = true
