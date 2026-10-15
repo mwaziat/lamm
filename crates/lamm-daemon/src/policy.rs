@@ -65,7 +65,7 @@ impl Visibility {
         }
 
         let pct = match self {
-            Self::Active | Self::Visible => 0.10,
+            Self::Active | Self::Visible => 0.06,
             Self::Background => 0.20,
             Self::Idle => 0.35,
         };
@@ -73,9 +73,9 @@ impl Visibility {
         let calculated = (current_mb as f64 * pct) as u64;
 
         match self {
-            Self::Active | Self::Visible => calculated.min(800),
-            Self::Background => calculated.min(1000),
-            Self::Idle => calculated.min(2500),
+            Self::Active | Self::Visible => calculated.min(300),
+            Self::Background => calculated.min(800),
+            Self::Idle => calculated.min(2000),
         }
     }
 
@@ -118,15 +118,24 @@ fn runtime_file() -> io::Result<PathBuf> {
     Ok(PathBuf::from(dir).join("lamm-activity.csv"))
 }
 
+fn is_managed_scope(component: &str) -> bool {
+    let valid_prefix = component.starts_with("app-")
+        || component.starts_with("snap.")
+        || component.starts_with("ptyxis-spawn-")
+        || component.starts_with("vte-spawn-")
+        || component.starts_with("flatpak-");
+
+    valid_prefix
+        && component.ends_with(".scope")
+        && component.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'@' | b'-' | b'\\'))
+}
+
 fn resolve_target_scope(pid: u32) -> io::Result<Option<TargetScope>> {
     let cgroups = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
     for line in cgroups.lines() {
         if let Some(path) = line.strip_prefix("0::") {
             for component in path.split('/') {
-                let is_app_scope = (component.starts_with("app-") || component.starts_with("snap."))
-                    && component.ends_with(".scope")
-                    && component.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'@' | b'-' | b'\\'));
-                if is_app_scope {
+                if is_managed_scope(component) {
                     return Ok(Some(TargetScope {
                         unit: component.to_owned(),
                         cgroup_rel_path: path.to_owned(),
@@ -197,14 +206,24 @@ fn bridge_states(path: &Path) -> io::Result<HashMap<String, ScopeInfo>> {
     Ok(states)
 }
 
+fn user_app_slice_path() -> (PathBuf, String) {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    let uid = unsafe { getuid() };
+    let rel_prefix = format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice");
+    let full_path = PathBuf::from(format!("/sys/fs/cgroup{rel_prefix}"));
+    (full_path, rel_prefix)
+}
+
 fn discover_active_app_scopes() -> HashMap<String, ScopeInfo> {
     let mut states = HashMap::new();
-    let app_slice = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice";
+    let (app_slice, rel_prefix) = user_app_slice_path();
     if let Ok(entries) = fs::read_dir(app_slice) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if (name.starts_with("app-") || name.starts_with("snap.")) && name.ends_with(".scope") {
-                let rel_path = format!("/user.slice/user-1000.slice/user@1000.service/app.slice/{name}");
+            if is_managed_scope(&name) {
+                let rel_path = format!("{rel_prefix}/{name}");
                 states.insert(
                     name,
                     ScopeInfo {
@@ -295,11 +314,14 @@ pub fn run_policy() {
         last_file_mtime = mtime;
         last_periodic_check = Instant::now();
 
-        let current = if fresh {
-            bridge_states(&path).unwrap_or_else(|_| discover_active_app_scopes())
-        } else {
-            discover_active_app_scopes()
-        };
+        let mut current = discover_active_app_scopes();
+        if fresh {
+            if let Ok(bridge) = bridge_states(&path) {
+                for (unit, info) in bridge {
+                    current.insert(unit, info);
+                }
+            }
+        }
 
         let now = Instant::now();
 
@@ -335,6 +357,7 @@ pub fn run_policy() {
                             eprintln!("LAMM policy: {error}");
                             last_error = Instant::now();
                         }
+                        applied.insert(unit.clone(), state);
                     }
                 }
             }
@@ -398,8 +421,8 @@ mod tests {
 
         assert_eq!(Visibility::Background.memory_low(), "0");
         assert_eq!(Visibility::Active.percentage_reclaim_mb(50), 0);
-        // 10% of 2000MB => 200MB
-        assert_eq!(Visibility::Active.percentage_reclaim_mb(2000), 200);
+        // 6% of 2000MB => 120MB
+        assert_eq!(Visibility::Active.percentage_reclaim_mb(2000), 120);
         // 20% of 2000MB => 400MB
         assert_eq!(Visibility::Background.percentage_reclaim_mb(2000), 400);
         // 35% of 2000MB => 700MB
@@ -412,5 +435,16 @@ mod tests {
         assert!(is_protected_unit("wireplumber.service"));
         assert!(is_protected_unit("gnome-shell.scope"));
         assert_eq!(is_protected_unit("app-gnome-firefox-123.scope"), false);
+    }
+
+    #[test]
+    fn test_managed_scopes() {
+        assert!(is_managed_scope("app-gnome-google-chrome-123.scope"));
+        assert!(is_managed_scope("snap.code.code-uuid.scope"));
+        assert!(is_managed_scope("ptyxis-spawn-uuid.scope"));
+        assert!(is_managed_scope("vte-spawn-uuid.scope"));
+        assert!(is_managed_scope("flatpak-app.scope"));
+        assert_eq!(is_managed_scope("pipewire.service"), false);
+        assert_eq!(is_managed_scope("dbus.socket"), false);
     }
 }

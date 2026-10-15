@@ -8,8 +8,8 @@ The Rust daemon monitors window activity and dynamically scales memory reclaim p
 
 | State | Condition | CPUWeight | MemoryLow | IOWeight | Dynamic Cache Reclaim | Cooldown |
 |---|---|---:|---:|---:|---:|---|
-| **ACTIVE** | Focused window | 400 | 256M | 400 | **~10%** (max 800 MB) | 5 minutes |
-| **VISIBLE** | Split-screen / visible | 250 | 128M | 250 | **~10%** (max 800 MB) | 5 minutes |
+| **ACTIVE** | Focused window | 400 | 256M | 400 | **~6%** (max 300 MB) | 5 minutes |
+| **VISIBLE** | Split-screen / visible | 250 | 128M | 250 | **~6%** (max 300 MB) | 5 minutes |
 | **BACKGROUND** | Obscured / minimized (< 2 min) | 80 | 0 | 100 | **~20%** (max 600 MB) | 60 seconds |
 | **IDLE** | Inactive in background (>= 2 min) | 50 | 0 | 50 | **~35% - 50%** (max 2500 MB) | 60 seconds |
 
@@ -23,6 +23,9 @@ The Rust daemon monitors window activity and dynamically scales memory reclaim p
 - **Firefox (~600 MB)**:
   - Background: 20% = **~120 MB** reclaimed
   - Idle: 35% = **~210 MB** reclaimed
+- **Terminal Dev Servers (Next.js / Turbopack / Vite in Ptyxis or GNOME Terminal)**:
+  - Managed via `ptyxis-spawn-*.scope` & `vte-spawn-*.scope`
+  - Reclaims **~200 MB to 1.2 GB** of cold inactive page cache without touching Node.js V8 JS heap or disrupting Hot Module Replacement (HMR)
 - **Small Apps (< 80 MB)**: Skipped to preserve stability
 
 ## Verification & Testing
