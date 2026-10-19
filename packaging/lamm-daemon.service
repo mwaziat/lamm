@@ -8,6 +8,8 @@ ExecStart=%h/.local/bin/lamm-daemon
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
+OOMScoreAdjust=-250
+ManagedOOMPreference=avoid
 
 [Install]
 WantedBy=default.target

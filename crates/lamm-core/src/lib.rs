@@ -27,12 +27,44 @@ pub struct ProcessSample {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ZramInfo {
+    pub active: bool,
+    pub disksize_bytes: u64,
+    pub orig_data_bytes: u64,
+    pub compr_data_bytes: u64,
+    pub mem_used_bytes: u64,
+    pub algorithm: String,
+    pub swappiness: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    pub retention_floor_pct: u8,
+    pub idle_timeout_secs: u64,
+    pub critical_available_mb: u64,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            retention_floor_pct: 50,
+            idle_timeout_secs: 120,
+            critical_available_mb: 1500,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub epoch_seconds: u64,
     pub memory: MemorySnapshot,
     pub pressure: Pressure,
     pub top_processes: Vec<ProcessSample>,
     pub mode: String,
+    #[serde(default)]
+    pub zram: Option<ZramInfo>,
+    #[serde(default)]
+    pub policy_config: Option<PolicyConfig>,
 }
 
 pub fn parse_meminfo(input: &str) -> io::Result<MemorySnapshot> {
@@ -122,8 +154,90 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
     Ok(Snapshot {
         epoch_seconds: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        memory, pressure, top_processes, mode: "adaptive-os-policy".to_string(),
+        memory,
+        pressure,
+        top_processes,
+        mode: "adaptive-os-policy".to_string(),
+        zram: Some(read_zram_info()),
+        policy_config: Some(load_policy_config()),
     })
+}
+
+pub fn read_zram_info() -> ZramInfo {
+    let disksize_bytes = fs::read_to_string("/sys/block/zram0/disksize")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let active = disksize_bytes > 0;
+
+    let algorithm = fs::read_to_string("/sys/block/zram0/comp_algorithm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace().find_map(|word| {
+                if word.starts_with('[') && word.ends_with(']') {
+                    Some(word[1..word.len() - 1].to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let (orig_data_bytes, compr_data_bytes, mem_used_bytes) = fs::read_to_string("/sys/block/zram0/mm_stat")
+        .ok()
+        .map(|s| {
+            let mut parts = s.split_whitespace();
+            let orig = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let compr = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let used = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            (orig, compr, used)
+        })
+        .unwrap_or((0, 0, 0));
+
+    let swappiness = fs::read_to_string("/proc/sys/vm/swappiness")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(60);
+
+    ZramInfo {
+        active,
+        disksize_bytes,
+        orig_data_bytes,
+        compr_data_bytes,
+        mem_used_bytes,
+        algorithm,
+        swappiness,
+    }
+}
+
+pub fn load_policy_config() -> PolicyConfig {
+    let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    else {
+        return PolicyConfig::default();
+    };
+    let file = config_dir.join("lamm").join("config.json");
+    if let Ok(data) = fs::read_to_string(&file) {
+        if let Ok(cfg) = serde_json::from_str(&data) {
+            return cfg;
+        }
+    }
+    PolicyConfig::default()
+}
+
+pub fn save_policy_config(config: &PolicyConfig) -> io::Result<()> {
+    let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    else {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "config dir missing"));
+    };
+    let dir = config_dir.join("lamm");
+    fs::create_dir_all(&dir)?;
+    let data = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
+    fs::write(dir.join("config.json"), data)
 }
 
 pub fn socket_path() -> io::Result<std::path::PathBuf> {

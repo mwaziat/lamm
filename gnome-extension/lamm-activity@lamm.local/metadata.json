@@ -1,1 +1,1 @@
-{"uuid":"lamm-activity@lamm.local","name":"LAMM Activity Bridge","description":"Publishes active and visible application PIDs for LAMM policy engine","shell-version":["50"]}
+{"uuid":"lamm-activity@lamm.local","name":"LAMM Activity Bridge","description":"Publishes active and visible application PIDs for LAMM policy engine","shell-version":["45","46","47","48","49","50"]}

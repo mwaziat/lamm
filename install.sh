@@ -42,7 +42,8 @@ echo "--> Configuring systemd user service..."
 install -d "$HOME/.config/systemd/user"
 install -m 644 packaging/lamm-daemon.service "$HOME/.config/systemd/user/lamm-daemon.service"
 systemctl --user daemon-reload
-systemctl --user enable --now lamm-daemon.service
+systemctl --user enable lamm-daemon.service
+systemctl --user restart lamm-daemon.service
 
 # 5. Install desktop application launcher
 install -d "$HOME/.local/share/applications"
@@ -60,10 +61,23 @@ if command -v gnome-extensions >/dev/null 2>&1; then
     gnome-extensions enable "$UUID" 2>/dev/null || true
 fi
 
+# 7. ZRAM Virtual Memory & Fast Paging setup
+echo "--> Checking ZRAM Fast Paging & Kernel VM status..."
+CURRENT_SWAPPINESS=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo 0)
+if swapon --show | grep -q "/dev/zram0" && [ "$CURRENT_SWAPPINESS" -ge 100 ] && grep -q "apply)" /usr/local/bin/lamm-zram-helper 2>/dev/null; then
+    echo "    [OK] ZRAM Virtual RAM is active and optimized (swappiness: ${CURRENT_SWAPPINESS})."
+else
+    echo "    Configuring ZRAM Virtual RAM & Fast Paging (requires sudo)..."
+    if [ -x ./scripts/setup-zram.sh ]; then
+        sudo ./scripts/setup-zram.sh
+    fi
+fi
+
 echo ""
 echo "=== LAMM Installation Complete ==="
-echo "- Status: systemctl --user status lamm-daemon"
-echo "- CLI:    ~/.local/bin/lammctl"
-echo "- GUI:    ~/.local/bin/lamm-ui (or launch 'LAMM' from application menu)"
-echo "- Note:   If on Wayland and extension wasn't active, log out and back in once."
+echo "- Status:    systemctl --user status lamm-daemon"
+echo "- CLI:       ~/.local/bin/lammctl"
+echo "- GUI:       ~/.local/bin/lamm-ui (or launch 'LAMM' from application menu)"
+echo "- Uninstall: ./uninstall.sh (safely restores 100% of Ubuntu defaults)"
+echo "- Note:      If on Wayland and extension wasn't active, log out and back in once."
 
